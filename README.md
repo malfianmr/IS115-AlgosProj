@@ -1,4 +1,4 @@
-# IS115 Project: G3T4 ReadMe
+# IS115 Project: Last-Mile Delivery Dispatch
 
 Our performance metric is **Total Daily Cost** (lower is better):
 

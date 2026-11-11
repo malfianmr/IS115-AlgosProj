@@ -1,411 +1,463 @@
-"""Shared helper functions for all dispatch policies.
+"""Helper functions shared by all the delivery rules.
 
-Every policy file imports only from this module, as the project brief asks.
-The helpers are grouped by the idea they belong to:
+Every rule file imports from here, as the project brief asks.
+Written to be easy to read: plain loops, short functions, lots of comments.
 
-    A. Basic tools               (waiting parcels, grouping, range/time checks)
-    B. Greedy nearest neighbour  (Week 11 greedy TSP; Week 7 hash map)
-    C. Urgency                   (Week 7 heap / priority queue)
-    D. 2-opt local search        (Week 11 local search)
-    E. Zones                     (Week 9 graph + BFS; Week 5 queue; Week 7 hash map)
-    F. Waiting for a fuller van  (threshold heuristic)
+Words used below:
+    parcel   = the dictionary of all parcels (from the simulator)
+    context  = the dictionary with time, distances and van limits (from the simulator)
+    trip     = a list of parcel IDs, in delivery order
+    stop     = a delivery location, e.g. "L001"
 
-Only the Python standard library is used. Inputs are never modified.
+Parts of this file:
+    A. Basic tools
+    B. Build a trip     (greedy nearest neighbour, Week 11 + heap, Week 7)
+    C. Tidy a trip      (2-opt local search, Week 11)
+    D. Areas            (graph + BFS, Weeks 5 and 9)
+    E. Go now or wait?
 
-Notation used in the complexity notes:
-    P = parcels seen so far, L = locations (36), k = stops in one trip,
-    Z = areas (6), I = 2-opt passes (at most MAX_PASSES).
+Letters used in the Big-O notes:
+    P = parcels, L = locations (36), k = stops in one trip, Z = areas (6)
 """
 
 import heapq
-from collections import deque
-from typing import Dict, List, Optional, Set
 
 HUB = "HUB"
-EPS = 1e-9            # tolerance for float rounding when sizes add up exactly to capacity
-MAX_PASSES = 50       # safety cap on 2-opt improvement passes
-LINK_KM = 10.0        # two locations at most this far apart are in the same area
-PLANNING_INTERVAL = 10.0  # minutes between planning rounds (from the brief)
+TINY = 0.000000001   # tiny allowance so rounding errors (e.g. 26.999999999999993) do not change a decision
 
 
-# ---------------------------------------------------------------------------
-# A. Basic tools
-# ---------------------------------------------------------------------------
+# =====================================================================
+# PART A: Basic tools
+# =====================================================================
 
-def waiting_parcels(parcel: Dict[str, dict]) -> List[str]:
-    """IDs of parcels not yet assigned or delivered, in arrival order.
+def get_waiting_parcels(parcel):
+    """Return the IDs of parcels still at the hub, oldest first.  O(P log P)"""
+    pairs = []
+    for parcel_id in parcel:
+        info = parcel[parcel_id]
+        # Waiting = not on a van yet AND not delivered yet
+        if info["vehicle_assigned"] is None and info["delivery_time"] is None:
+            pairs.append((info["arrival_time"], parcel_id))
+    pairs.sort()                      # sorts by arrival time, then by ID (Week 3 sorting)
 
-    Time O(P log P) (the sort). Space O(P).
-    """
-
-    waiting = [
-        parcel_id
-        for parcel_id, record in parcel.items()
-        if record["vehicle_assigned"] is None and record["delivery_time"] is None
-    ]
-    waiting.sort(key=lambda parcel_id: (parcel[parcel_id]["arrival_time"], parcel_id))
+    waiting = []
+    for arrival_time, parcel_id in pairs:
+        waiting.append(parcel_id)
     return waiting
 
 
-def group_by_location(parcel: Dict[str, dict], parcel_ids: List[str]) -> Dict[str, List[str]]:
-    """Hash map: location ID -> list of parcel IDs going there (order kept).
-
-    Time O(n) for n parcel IDs. Space O(n).
-    """
-
-    groups: Dict[str, List[str]] = {}
+def group_by_stop(parcel, parcel_ids):
+    """Hash map (Week 7): stop -> list of parcel IDs going there.  O(P)"""
+    groups = {}
     for parcel_id in parcel_ids:
-        location = parcel[parcel_id]["delivery_location_id"]
-        groups.setdefault(location, []).append(parcel_id)
+        stop = parcel[parcel_id]["delivery_location_id"]
+        if stop not in groups:
+            groups[stop] = []         # first parcel for this stop: make an empty list
+        groups[stop].append(parcel_id)
     return groups
 
 
-def can_extend(travelled: float, here: str, there: str,
-               distances: Dict[str, Dict[str, float]], departure: float, context: dict) -> bool:
-    """True if the van can go here -> there and still get back to the hub in range and on time.
+def can_go_and_come_back(km_so_far, here, there, context):
+    """Can the van drive here -> there, then back to the hub, within 320 km and by 18:00?  O(1)"""
+    dist = context["travel_distance"]
+    leave_time = context["current_time"] + context["departure_delay"]
 
-    travelled = km from the hub to `here` (not counting the return leg).
-    At 60 km/h, km equals minutes. Time O(1).
-    """
+    total_km = km_so_far + dist[here][there] + dist[there][HUB]
 
-    round_trip = travelled + distances[here][there] + distances[there][HUB]
-    if round_trip > context["max_trip_distance_km"] + EPS:
-        return False
-    return departure + round_trip <= context["return_cutoff"]
+    if total_km > context["max_trip_distance_km"] + TINY:
+        return False                  # too far for the battery
+    if leave_time + total_km > context["return_cutoff"]:
+        return False                  # back after 18:00 (60 km/h, so 1 km = 1 minute)
+    return True
 
 
-def route_distance(locations: List[str], distances: Dict[str, Dict[str, float]]) -> float:
-    """Total km for HUB -> locations in order -> HUB. Time O(k)."""
-
+def route_length(stops, dist):
+    """Total km for: HUB -> each stop in order -> back to HUB.  O(k)"""
     total = 0.0
     here = HUB
-    for there in locations:
-        total += distances[here][there]
-        here = there
-    return total + distances[here][HUB]
+    for stop in stops:
+        total = total + dist[here][stop]
+        here = stop
+    total = total + dist[here][HUB]   # drive back to the hub
+    return total
 
 
-# ---------------------------------------------------------------------------
-# B. Greedy nearest neighbour (Week 11 "1st greedy algorithm for TSP")
-# ---------------------------------------------------------------------------
+# =====================================================================
+# PART B: Build a trip (greedy nearest neighbour + heap for urgency)
+# =====================================================================
 
-def nearest_neighbour_fill(parcel: Dict[str, dict], context: dict,
-                           groups: Dict[str, List[str]],
-                           first_stop: Optional[str] = None) -> List[str]:
-    """Build one trip greedily: always drive to the closest location with waiting parcels.
+def closest_reachable_stop(groups, here, km_so_far, context):
+    """Greedy step (Week 11): the closest stop with waiting parcels that the van can still reach.  O(L)"""
+    dist = context["travel_distance"]
+    best_stop = None
+    best_km = None
+    for stop in groups:
+        if not can_go_and_come_back(km_so_far, here, stop, context):
+            continue
+        km = dist[here][stop]
+        # Closer wins; if two are equally close, the smaller name wins (so results never change)
+        if best_stop is None or km < best_km or (km == best_km and stop < best_stop):
+            best_stop = stop
+            best_km = km
+    return best_stop
 
-    groups     : hash map location -> parcels (the loading order inside each list is kept)
-    first_stop : if given, the first stop is this location instead of the closest one
 
-    At each stop, take as many of that location's parcels as still fit.
-    Stop when the van is full or no location can be reached and returned from in time.
-    The `groups` dictionary is consumed (popped) as stops are visited.
+def fill_van(parcel, context, groups, first_stop):
+    """Greedy nearest neighbour (Week 11): from the hub, keep driving to the closest stop
+    and load what fits, until the van is full or nothing else can be reached.
 
-    Time O(L^2): up to L stops, each scanning up to L candidates. Space O(k).
+    groups     = hash map stop -> parcels (loaded in the order of each list)
+    first_stop = a stop to visit first, or None to start with the closest stop
+    O(L^2): up to L stops, each time checking up to L stops.
     """
-
-    distances = context["travel_distance"]
+    dist = context["travel_distance"]
     capacity = context["capacity"]
-    departure = context["current_time"] + context["departure_delay"]
 
-    route: List[str] = []
+    trip = []
     load = 0.0
-    travelled = 0.0  # km from the hub to the current stop
+    km_so_far = 0.0
     here = HUB
     next_stop = first_stop
 
-    while groups:
+    while len(groups) > 0:
         if next_stop is None:
-            # Greedy choice: the closest location we can still reach and return from.
-            for location in groups:
-                if not can_extend(travelled, here, location, distances, departure, context):
-                    continue
-                if next_stop is None or (distances[here][location], location) < (distances[here][next_stop], next_stop):
-                    next_stop = location
+            next_stop = closest_reachable_stop(groups, here, km_so_far, context)
             if next_stop is None:
-                break
+                break                 # nothing reachable: trip is finished
 
-        # Take as many parcels for this location as still fit.
-        taken_any = False
+        # Load this stop's parcels (as many as fit), and remove the stop from the list
+        loaded_something = False
         for parcel_id in groups.pop(next_stop):
             size = parcel[parcel_id]["size"]
-            if load + size <= capacity + EPS:
-                route.append(parcel_id)
-                load += size
-                taken_any = True
-        if taken_any:
-            travelled += distances[here][next_stop]
+            if load + size <= capacity + TINY:
+                trip.append(parcel_id)
+                load = load + size
+                loaded_something = True
+
+        if loaded_something:
+            km_so_far = km_so_far + dist[here][next_stop]      # the van moves to this stop
             here = next_stop
-        next_stop = None
-        if load >= capacity - EPS:
-            break
 
-    return route
+        next_stop = None              # next time round: pick the closest stop again
+        if load >= capacity - TINY:
+            break                     # van is full: trip is finished
 
-
-# ---------------------------------------------------------------------------
-# C. Urgency (Week 7 heap / priority queue)
-# ---------------------------------------------------------------------------
-
-def urgency_key(parcel: Dict[str, dict], parcel_id: str):
-    """Sort key: earliest deadline first, then earliest arrival, then ID."""
-
-    record = parcel[parcel_id]
-    return (record["delivery_window_end"], record["arrival_time"], parcel_id)
+    return trip
 
 
-def pick_urgent_first_stop(parcel: Dict[str, dict], waiting: List[str], context: dict) -> Optional[str]:
-    """Location of the most urgent parcel that can still be delivered on time.
+def most_urgent_stop(parcel, waiting, context):
+    """Use a heap (Week 7) to find the stop of the most urgent parcel that can still be on time.
+    O(P log P)"""
+    dist = context["travel_distance"]
+    leave_time = context["current_time"] + context["departure_delay"]
 
-    All waiting parcels go into a min-heap keyed by deadline. We pop until we
-    find a parcel the van can reach on time (driving straight there). If none
-    can be on time, the most urgent reachable parcel is used instead.
+    # Put every waiting parcel into a min-heap, smallest deadline on top
+    heap = []
+    for parcel_id in waiting:
+        info = parcel[parcel_id]
+        heapq.heappush(heap, (info["delivery_window_end"], info["arrival_time"], parcel_id))
 
-    Time O(P) to heapify + O(log P) per pop, worst case O(P log P). Space O(P).
-    """
+    backup_stop = None
+    while len(heap) > 0:
+        deadline, arrival_time, parcel_id = heapq.heappop(heap)   # most urgent parcel left
+        stop = parcel[parcel_id]["delivery_location_id"]
 
-    distances = context["travel_distance"]
-    departure = context["current_time"] + context["departure_delay"]
+        if not can_go_and_come_back(0.0, HUB, stop, context):
+            continue                  # van cannot even get there and back in time: skip
 
-    heap = [urgency_key(parcel, p) for p in waiting]
-    heapq.heapify(heap)
+        if backup_stop is None:
+            backup_stop = stop        # remember the most urgent reachable stop, just in case
 
-    fallback = None
-    while heap:
-        deadline, _, parcel_id = heapq.heappop(heap)
-        location = parcel[parcel_id]["delivery_location_id"]
-        if not can_extend(0.0, HUB, location, distances, departure, context):
-            continue  # cannot reach and return in time at all
-        if fallback is None:
-            fallback = location  # most urgent reachable parcel
-        if departure + distances[HUB][location] <= deadline:
-            return location  # most urgent parcel that can still be on time
-    return fallback
+        arrive_time = leave_time + dist[HUB][stop]
+        if arrive_time <= deadline:
+            return stop               # can still be on time: start the trip here
+
+    return backup_stop                # nobody can be on time: use the backup
 
 
-def urgent_nearest_trip(parcel: Dict[str, dict], context: dict) -> List[str]:
-    """Rule 2's trip: urgent first stop (heap), then greedy nearest neighbour.
+def sort_by_deadline(parcel, parcel_ids):
+    """Return the parcel IDs sorted so the earliest deadline comes first."""
+    triples = []
+    for parcel_id in parcel_ids:
+        info = parcel[parcel_id]
+        triples.append((info["delivery_window_end"], info["arrival_time"], parcel_id))
+    triples.sort()
 
-    Inside each location the most urgent parcels are loaded first.
-    Time O(P log P + L^2). Space O(P).
-    """
+    result = []
+    for deadline, arrival_time, parcel_id in triples:
+        result.append(parcel_id)
+    return result
 
-    waiting = waiting_parcels(parcel)
-    if not waiting:
+
+def build_trip(parcel, context):
+    """Rule 2's trip: start at the most urgent stop (heap), then keep going to the closest stop.
+    O(P log P + L^2)"""
+    waiting = get_waiting_parcels(parcel)
+    if len(waiting) == 0:
         return []
-    first_stop = pick_urgent_first_stop(parcel, waiting, context)
+
+    first_stop = most_urgent_stop(parcel, waiting, context)
     if first_stop is None:
         return []
 
-    groups = group_by_location(parcel, waiting)
-    for parcel_ids in groups.values():
-        parcel_ids.sort(key=lambda p: urgency_key(parcel, p))
-    return nearest_neighbour_fill(parcel, context, groups, first_stop=first_stop)
+    groups = group_by_stop(parcel, waiting)
+    for stop in groups:
+        groups[stop] = sort_by_deadline(parcel, groups[stop])  # urgent parcels load first
+
+    return fill_van(parcel, context, groups, first_stop)
 
 
-# ---------------------------------------------------------------------------
-# D. 2-opt local search (Week 11)
-# ---------------------------------------------------------------------------
+# =====================================================================
+# PART C: Tidy the trip (2-opt local search, Week 11)
+# =====================================================================
 
-def two_opt(stops: List[str], distances: Dict[str, Dict[str, float]]) -> List[str]:
-    """Improve the order of stops with 2-opt until no move shortens the route.
+def reverse_part(stops, i, j):
+    """Return a new list where stops[i] .. stops[j] are in reverse order."""
+    before = stops[:i]
+    middle = stops[i:j + 1]
+    after = stops[j + 1:]
+    middle.reverse()
+    return before + middle + after
 
-    A 2-opt move reverses one segment of the route (removes two edges and
-    reconnects the tour). Keep any move that makes the route shorter.
-    Time O(k^2) moves per pass x O(k) to measure each = O(k^3) per pass,
-    at most MAX_PASSES passes. Space O(k).
-    """
 
+def two_opt(stops, dist):
+    """Keep reversing parts of the route while that makes it shorter.
+    O(k^2) reversals per pass, each measured in O(k), at most 50 passes."""
     best = list(stops)
-    best_km = route_distance(best, distances)
-    for _ in range(MAX_PASSES):
+    best_km = route_length(best, dist)
+
+    passes = 0
+    improved = True
+    while improved and passes < 50:              # 50 = safety limit
         improved = False
+        passes = passes + 1
         for i in range(len(best) - 1):
             for j in range(i + 1, len(best)):
-                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
-                candidate_km = route_distance(candidate, distances)
-                if candidate_km < best_km - EPS:
-                    best, best_km = candidate, candidate_km
+                new_route = reverse_part(best, i, j)
+                new_km = route_length(new_route, dist)
+                if new_km < best_km - TINY:      # shorter? keep it
+                    best = new_route
+                    best_km = new_km
                     improved = True
-        if not improved:
-            break
     return best
 
 
-def improve_with_two_opt(parcel: Dict[str, dict], route: List[str],
-                         distances: Dict[str, Dict[str, float]]) -> List[str]:
-    """Reorder a trip's stops with 2-opt; parcels for the same stop stay together.
+def tidy_trip(parcel, trip, dist):
+    """Reorder the trip's stops with 2-opt. Parcels for the same stop stay together.
+    The parcels do not change and the route only gets shorter, so no limit can be broken."""
+    if len(trip) < 2:
+        return trip
 
-    The set of parcels does not change (capacity still holds) and the route can
-    only get shorter (range and the 18:00 return still hold).
-    """
+    # 1. Turn the parcel list into a stop list (each stop once, in visiting order)
+    stops = []
+    parcels_at = {}                              # hash map: stop -> its parcels on this trip
+    for parcel_id in trip:
+        stop = parcel[parcel_id]["delivery_location_id"]
+        if stop not in parcels_at:
+            stops.append(stop)
+            parcels_at[stop] = []
+        parcels_at[stop].append(parcel_id)
 
-    if len(route) < 2:
-        return route
-    stops: List[str] = []
-    by_stop: Dict[str, List[str]] = {}
-    for parcel_id in route:
-        location = parcel[parcel_id]["delivery_location_id"]
-        if location not in by_stop:
-            stops.append(location)
-            by_stop[location] = []
-        by_stop[location].append(parcel_id)
+    # 2. Find a shorter order for the stops
+    better_stops = two_opt(stops, dist)
 
-    better_stops = two_opt(stops, distances)
-    return [parcel_id for location in better_stops for parcel_id in by_stop[location]]
-
-
-def urgent_nearest_2opt_trip(parcel: Dict[str, dict], context: dict) -> List[str]:
-    """Rule 3's trip: urgent_nearest_trip, then 2-opt on the stop order."""
-
-    route = urgent_nearest_trip(parcel, context)
-    return improve_with_two_opt(parcel, route, context["travel_distance"])
+    # 3. Turn it back into a parcel list
+    new_trip = []
+    for stop in better_stops:
+        for parcel_id in parcels_at[stop]:
+            new_trip.append(parcel_id)
+    return new_trip
 
 
-# ---------------------------------------------------------------------------
-# E. Zones (Week 9 graph + BFS, Week 5 queue, Week 7 hash map)
-# ---------------------------------------------------------------------------
+# =====================================================================
+# PART D: Areas (graph + BFS, Weeks 5 and 9)
+# =====================================================================
 
-def find_areas(distances: Dict[str, Dict[str, float]]) -> List[List[str]]:
-    """Split the town into areas = connected components of the 'nearby locations' graph.
+def find_areas(dist):
+    """Split the stops into areas: stops 10 km or less apart are linked (graph),
+    and BFS finds each group of linked stops (connected components).  O(L^2)"""
 
-    Graph: each location is a vertex; an edge joins two locations at most
-    LINK_KM apart. Components are found with breadth-first search (queue).
-    Time O(L^2) (every pair checked once). Space O(L^2) adjacency lists worst case.
-    """
+    # 1. All stops except the hub, in name order
+    stops = []
+    for stop in dist:
+        if stop != HUB:
+            stops.append(stop)
+    stops.sort()
 
-    locations = sorted(loc for loc in distances if loc != HUB)
-    neighbours: Dict[str, List[str]] = {loc: [] for loc in locations}
-    for i, a in enumerate(locations):
-        for b in locations[i + 1:]:
-            if min(distances[a][b], distances[b][a]) <= LINK_KM:
+    # 2. Build the graph as an adjacency list: stop -> list of nearby stops
+    neighbours = {}
+    for stop in stops:
+        neighbours[stop] = []
+    for a in stops:
+        for b in stops:
+            if a < b and min(dist[a][b], dist[b][a]) <= 10.0:
                 neighbours[a].append(b)
                 neighbours[b].append(a)
 
-    seen: Set[str] = set()
-    areas: List[List[str]] = []
-    for start in locations:
+    # 3. BFS from each stop that is not in an area yet
+    seen = set()
+    areas = []
+    for start in stops:
         if start in seen:
             continue
         seen.add(start)
-        queue = deque([start])
+        queue = [start]                          # a simple queue made from a list
         area = []
-        while queue:
-            here = queue.popleft()
+        while len(queue) > 0:
+            here = queue.pop(0)                  # dequeue from the front
             area.append(here)
             for nxt in neighbours[here]:
                 if nxt not in seen:
                     seen.add(nxt)
-                    queue.append(nxt)
-        areas.append(sorted(area))
+                    queue.append(nxt)            # enqueue at the back
+        area.sort()
+        areas.append(area)
     return areas
 
 
-def assign_vans(areas: List[List[str]], distances: Dict[str, Dict[str, float]],
-                vehicle_ids: List[int]) -> Dict[int, Set[str]]:
-    """Hash map vehicle_id -> set of locations in its area.
+def share_vans(areas, dist, van_ids):
+    """Hash map: van ID -> set of stops in its area.
 
-    Far areas take longer to reach, so they get more vans. Each area's weight is
-    (number of locations x average distance from the hub); vans are shared in
-    proportion to weight (at least one each) by the largest-remainder method.
-    Time O(Z log Z).
+    Far areas take longer to reach, so they get more vans:
+      1. work of an area = number of stops x average km from the hub
+      2. fair share of vans = total vans x (its work / all work), e.g. 1.96
+      3. round down (but every area gets at least 1 van)
+      4. spare vans go to the areas with the biggest decimal part (largest remainder)
     """
+    # 1. Work per area
+    work = []
+    for area in areas:
+        total_km = 0.0
+        for stop in area:
+            total_km = total_km + dist[HUB][stop]
+        work.append(len(area) * total_km / len(area))
 
-    weights = [len(area) * sum(distances[HUB][loc] for loc in area) / len(area) for area in areas]
-    n_vans = len(vehicle_ids)
-    total = sum(weights)
-    exact = [n_vans * w / total for w in weights]
-    counts = [max(1, int(x)) for x in exact]
-    order = sorted(range(len(areas)), key=lambda i: exact[i] - int(exact[i]), reverse=True)
-    k = 0
-    while sum(counts) < n_vans:
-        counts[order[k % len(order)]] += 1
-        k += 1
-    while sum(counts) > n_vans:
-        i = max(range(len(areas)), key=lambda i: (counts[i] - exact[i], counts[i]))
-        counts[i] -= 1
+    all_work = 0.0
+    for w in work:
+        all_work = all_work + w
+    number_of_vans = len(van_ids)
 
-    van_area: Dict[int, Set[str]] = {}
-    vans = sorted(vehicle_ids)
-    pos = 0
-    for area, count in zip(areas, counts):
-        for _ in range(count):
-            van_area[vans[pos]] = set(area)
-            pos += 1
+    # 2-3. Fair share, rounded down, at least 1
+    share = []
+    vans = []
+    for k in range(len(areas)):
+        exact = number_of_vans * work[k] / all_work
+        share.append(exact)
+        whole = int(exact)
+        if whole < 1:
+            whole = 1
+        vans.append(whole)
+
+    # 4. Order the areas by decimal part, biggest first (ties: earlier area first)
+    by_decimal = []
+    for k in range(len(areas)):
+        by_decimal.append((-(share[k] - int(share[k])), k))
+    by_decimal.sort()
+
+    # Hand out spare vans, biggest decimal first
+    i = 0
+    while sum(vans) < number_of_vans:
+        k = by_decimal[i % len(areas)][1]
+        vans[k] = vans[k] + 1
+        i = i + 1
+
+    # Too many (only possible because every area got at least 1): take one back
+    # from the area that got the most more than its fair share
+    while sum(vans) > number_of_vans:
+        best = 0
+        for k in range(len(areas)):
+            extra = vans[k] - share[k]
+            best_extra = vans[best] - share[best]
+            if extra > best_extra or (extra == best_extra and vans[k] > vans[best]):
+                best = k
+        vans[best] = vans[best] - 1
+
+    # Give the vans out in order: van 1, 2, ... to area 1, then area 2, ...
+    van_area = {}
+    sorted_vans = sorted(van_ids)
+    position = 0
+    for k in range(len(areas)):
+        for count in range(vans[k]):
+            van_area[sorted_vans[position]] = set(areas[k])
+            position = position + 1
     return van_area
 
 
-def my_area(context: dict) -> Set[str]:
-    """Locations in the area of the van being planned (context['vehicle_id'])."""
-
-    distances = context["travel_distance"]
-    areas = find_areas(distances)
-    return assign_vans(areas, distances, list(context["fleet"].keys()))[context["vehicle_id"]]
-
-
-def only_locations(parcel: Dict[str, dict], locations: Set[str]) -> Dict[str, dict]:
-    """Waiting parcels whose destination is in `locations`. Time O(P)."""
-
-    return {
-        pid: rec for pid, rec in parcel.items()
-        if rec["vehicle_assigned"] is None and rec["delivery_time"] is None
-        and rec["delivery_location_id"] in locations
-    }
+def get_my_area(context):
+    """The set of stops this van is in charge of.  O(L^2)"""
+    dist = context["travel_distance"]
+    areas = find_areas(dist)
+    van_ids = list(context["fleet"].keys())
+    van_area = share_vans(areas, dist, van_ids)
+    return van_area[context["vehicle_id"]]
 
 
-def busiest_area_parcels(parcel: Dict[str, dict], context: dict) -> Optional[Dict[str, dict]]:
-    """Waiting parcels of the area with the largest total waiting size (None if all empty).
+def parcels_in_area(parcel, area):
+    """A smaller dictionary with only the waiting parcels for stops in this area.  O(P)"""
+    result = {}
+    for parcel_id in parcel:
+        info = parcel[parcel_id]
+        waiting = info["vehicle_assigned"] is None and info["delivery_time"] is None
+        if waiting and info["delivery_location_id"] in area:
+            result[parcel_id] = info
+    return result
 
-    Time O(L^2 + Z * P).
-    """
 
-    best, best_load = None, 0.0
+def busiest_area_parcels(parcel, context):
+    """The waiting parcels of the area with the most waiting (by total size). Empty if none.
+    O(L^2 + Z x P)"""
+    best_parcels = {}
+    best_load = 0.0
     for area in find_areas(context["travel_distance"]):
-        waiting = only_locations(parcel, set(area))
-        load = sum(rec["size"] for rec in waiting.values())
-        if load > best_load:
-            best, best_load = waiting, load
-    return best
+        area_parcels = parcels_in_area(parcel, set(area))
+        load = 0.0
+        for parcel_id in area_parcels:
+            load = load + area_parcels[parcel_id]["size"]
+        if load > best_load + TINY:              # TINY: equal loads count as a tie, first area kept
+            best_parcels = area_parcels
+            best_load = load
+    return best_parcels
 
 
-# ---------------------------------------------------------------------------
-# F. Waiting for a fuller van
-# ---------------------------------------------------------------------------
+# =====================================================================
+# PART E: Go now or wait?
+# =====================================================================
 
-def harm_if_wait(route: List[str], parcel: Dict[str, dict], context: dict) -> bool:
-    """True if delaying this trip by one planning round (10 min) would hurt.
+def should_go_now(trip, parcel, context, min_fill):
+    """Go if the van is full enough, or if waiting 10 more minutes would cause a problem.  O(k)"""
+    dist = context["travel_distance"]
+    capacity = context["capacity"]
 
-    Harm = a parcel on the trip that is on time now would become late, or the
-    trip would no longer fit before the 18:00 return, or this is the last
-    planning round that can still depart. Time O(k).
-    """
-
-    distances = context["travel_distance"]
-    now = context["current_time"]
-    delay = context["departure_delay"]
-    later = now + PLANNING_INTERVAL
-
-    if later + delay >= context["return_cutoff"]:
+    # 1. Full enough? (e.g. min_fill 0.9 means at least 27 of 30)
+    load = 0.0
+    for parcel_id in trip:
+        load = load + parcel[parcel_id]["size"]
+    if load >= min_fill * capacity - TINY:       # TINY: adding decimals can give 26.999999999999993
         return True
 
-    depart_now = now + delay
+    leave_now = context["current_time"] + context["departure_delay"]
+    leave_later = leave_now + 10                 # next planning round is 10 minutes later
+
+    # 2. Last chance? If we wait, the van would leave at or after 18:00
+    if leave_later >= context["return_cutoff"]:
+        return True
+
+    # 3. Would a parcel on this trip be on time now, but late if we wait?
     km = 0.0
     here = HUB
-    for parcel_id in route:
-        there = parcel[parcel_id]["delivery_location_id"]
-        km += distances[here][there]
-        here = there
+    for parcel_id in trip:
+        stop = parcel[parcel_id]["delivery_location_id"]
+        km = km + dist[here][stop]
+        here = stop
         deadline = parcel[parcel_id]["delivery_window_end"]
-        if depart_now + km <= deadline < depart_now + PLANNING_INTERVAL + km:
+        on_time_now = leave_now + km <= deadline
+        late_if_wait = leave_later + km > deadline
+        if on_time_now and late_if_wait:
             return True
-    km += distances[here][HUB]
-    return depart_now + PLANNING_INTERVAL + km > context["return_cutoff"]
 
-
-def go_now(route: List[str], parcel: Dict[str, dict], context: dict, min_fill: float) -> bool:
-    """Go if the van is at least min_fill full, or if waiting would cause harm. Time O(k)."""
-
-    load = sum(parcel[p]["size"] for p in route)
-    if load >= min_fill * context["capacity"]:
+    # 4. If we wait, would the van get back after 18:00?
+    km = km + dist[here][HUB]
+    if leave_later + km > context["return_cutoff"]:
         return True
-    return harm_if_wait(route, parcel, context)
+
+    return False                                 # safe to wait for more parcels

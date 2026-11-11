@@ -60,7 +60,9 @@ def calculate_metrics(
         if event["event_type"] != "delivery":
             continue
         key = (event["vehicle_id"], event["trip_id"])
-        trips.setdefault(key, []).append(event["parcel_id"])
+        if key not in trips:
+            trips[key] = []           # first delivery of this trip: make an empty list
+        trips[key].append(event["parcel_id"])
         if event["time"] <= parcel_info[event["parcel_id"]]["window_end"]:
             on_time += 1
         else:
