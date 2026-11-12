@@ -1,0 +1,13 @@
+{
+  "total_daily_cost": 2447.16,
+  "km_cost": 1582.16,
+  "late_cost": 415.0,
+  "undelivered_cost": 450.0,
+  "total_km": 3164.31,
+  "total_parcels": 808,
+  "on_time_parcels": 695,
+  "late_parcels": 83,
+  "undelivered_parcels": 30,
+  "on_time_rate": 0.8601,
+  "number_of_trips": 37
+}
