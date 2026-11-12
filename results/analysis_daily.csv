@@ -1,7 +1,0 @@
-policy,mean_cost,std_cost,min_cost,max_cost,saving_vs_baseline_pct
-baseline,10204.27,282.47,9655.34,10929.13,0.0
-nearest_neighbour,3064.35,130.48,2777.01,3284.73,70.0
-urgent_nearest,2926.89,170.7,2615.38,3310.26,71.3
-urgent_nearest_2opt,2802.16,162.35,2492.65,3068.31,72.5
-zones_strict,3636.25,221.55,3214.11,4078.27,64.4
-zones_help,2634.28,175.01,2251.54,2852.46,74.2

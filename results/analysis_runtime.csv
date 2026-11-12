@@ -1,7 +1,0 @@
-policy,dispatch_calls_per_day,avg_ms_per_call,max_ms_per_call,policy_seconds_per_day
-baseline,30.7,0.095,0.889,0.003
-nearest_neighbour,87.0,0.052,0.415,0.005
-urgent_nearest,87.2,0.068,0.659,0.006
-urgent_nearest_2opt,100.5,0.102,2.208,0.01
-zones_strict,174.3,0.151,2.3,0.026
-zones_help,120.2,0.246,1.055,0.03
