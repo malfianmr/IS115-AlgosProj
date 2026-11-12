@@ -231,7 +231,7 @@ def two_opt(locations, distance):
             for j in range(i + 1, len(best)):
                 new_route = reverse_part(best, i, j)
                 new_km = route_length(new_route, distance)
-                if new_km < best_km:
+                if new_km < best_km - MARGIN:
                     best = new_route
                     best_km = new_km
                     improved = True
@@ -281,7 +281,7 @@ def build_zone_links(distance):
 
     for a in locations:
         for b in locations:
-            if a < b and min(distance[a][b], distance[b][a] <= 10):
+            if a < b and min(distance[a][b], distance[b][a]) <= 10:
                 links[a].append(b)
                 links[b].append(a)
 
