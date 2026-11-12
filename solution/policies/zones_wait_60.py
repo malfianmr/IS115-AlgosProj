@@ -4,7 +4,7 @@ from solution.policies.helpers import (get_my_zone, parcels_in_zone, busiest_zon
     For now, before this policy Vans just go deliver straight away if they have parcels to deliver. However, we now wait until a certain percentage of load before the van goes.
 """
 
-MIN_FILL = 0.6   # the van must be 90% full, unless waiting would cause a problem
+MIN_FILL = 0.6   # the van must be 60% full, unless waiting would cause a problem
 
 
 def dispatch(parcel, context):
