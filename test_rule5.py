@@ -28,3 +28,5 @@ print("A:", should_go_now(trip, relaxed, make_context(540.0), 0.9))   # expect F
 print("B:", should_go_now(trip, relaxed, make_context(540.0), 0.2))   # expect True  (full enough)
 print("C:", should_go_now(trip, tight,   make_context(540.0), 0.9))   # expect True  (P3 would turn late)
 print("D:", should_go_now(trip, relaxed, make_context(1040.0), 0.9))  # expect True  (last chance)
+print(0.1 + 0.2)
+print(0.1 + 0.2 == 0.3)

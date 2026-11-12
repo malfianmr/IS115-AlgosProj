@@ -1,6 +1,7 @@
 import heapq
 
 HUB = "HUB"
+MARGIN = 0.000000001
 
 # =====================================================================
 # Waiting Parcel, Group By Location, Fill Van, Check Hard Constraints Functions
@@ -55,7 +56,7 @@ def check_hard_rules(total_current_km, current_location, next_location, context)
     leave_time = context["current_time"] + context["departure_delay"]
 
     #Check if exceed 320km
-    if total_km > context["max_trip_distance_km"]:
+    if total_km > context["max_trip_distance_km"] + MARGIN:
         return False
 
     #Check if exceed 6pm
@@ -112,7 +113,7 @@ def fill_van(parcel, context, groups, first_location=None):
         loaded = False
         for parcel_id in reachable_parcels:
             size = parcel[parcel_id]["size"]
-            if load + size <= capacity:
+            if load + size <= capacity + MARGIN:
                 trip.append(parcel_id)
                 load = load + size
                 loaded = True
@@ -123,7 +124,7 @@ def fill_van(parcel, context, groups, first_location=None):
 
         next_location = None #Next parcel
 
-        if load >= capacity:
+        if load >= capacity - MARGIN:
             break
 
     return trip
@@ -377,7 +378,7 @@ def busiest_zone_parcels(parcel, context):
         for parcel_id in zone_parcels:
             load = load + zone_parcels[parcel_id]["size"]           
 
-        if load > best_load:                                           
+        if load > best_load + MARGIN:                                           
             best_parcels = zone_parcels
             best_load = load                                     
 
@@ -395,7 +396,7 @@ def should_go_now(trip, parcel, context, min_fill):
     load = 0.0
     for parcel_id in trip:
         load = load + parcel[parcel_id]["size"]                       
-    if load >= min_fill * capacity:
+    if load >= min_fill * capacity - MARGIN:
         return True
 
     leave_now = context["current_time"] + context["departure_delay"]
