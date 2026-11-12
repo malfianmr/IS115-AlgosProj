@@ -222,6 +222,7 @@ def two_opt(locations, distance):
     best = list(locations) #Copy of locations
     best_km = route_length(best, distance)
 
+    #Keeps checking if trip is shorter
     passes = 0
     improved = True
     while improved and passes < 50:
@@ -264,9 +265,10 @@ def tidy_trip(parcel, trip, distance):
     return new_trip
 
 # =====================================================================
-# Vans can only deliver to their assigned zones/area
+# Vans can only deliver to their assigned zones/area using BFS over Graphs
 # =====================================================================
 
+#Builds a relationship dictionary
 def build_zone_links(distance):
 
     locations = []
@@ -287,6 +289,7 @@ def build_zone_links(distance):
 
     return links
 
+#Does BFS to check which location belongs to which zone
 def build_zones(distance):
     links = build_zone_links(distance)
 
@@ -385,7 +388,7 @@ def busiest_zone_parcels(parcel, context):
     return best_parcels
 
 # =====================================================================
-# Vans can only deliver at a specific load
+# Vans can only deliver at a specific load using Load threshold
 # =====================================================================
 
 def should_go_now(trip, parcel, context, min_fill):
